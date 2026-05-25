@@ -1,0 +1,252 @@
+name: Mercari Watch
+
+on:
+  schedule:
+    - cron: "0,10,20,30,40,50 * * * *"   # 10分おき（UTC）
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mercari-watch
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 直近25分以内に実行済みならスキップ
+      - name: Guard - skip if ran within 25min
+        run: |
+          NOW=$(date -u +%s)
+          LAST=0
+          if [ -f .github/last_run_utc.txt ]; then LAST=$(cat .github/last_run_utc.txt || echo 0); fi
+          DIFF=$((NOW - LAST))
+          echo "Last run diff(sec): $DIFF"
+          if [ $DIFF -lt 1500 ]; then
+            echo "Run skipped (last run $DIFF sec ago)."
+            exit 0
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Playwright ブラウザキャッシュ
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-pw
+          restore-keys: |
+            ${{ runner.os }}-pw
+
+      - name: Install system deps for Playwright
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2t64 libnss3 libxss1 libgtk-3-0 libx11-xcb1 \
+            libxcb1 libxcomposite1 libxdamage1 libxrandr2 libgbm1 \
+            libpango-1.0-0 libcairo2 libatspi2.0-0 libdrm2
+
+      - name: Install npm deps
+        run: |
+          npm i nodemailer
+          npm i -D playwright
+          npx playwright install --with-deps chromium
+
+      - name: Run Mercari Watcher
+        env:
+          GITHUB_STEP_SUMMARY: ${{ github.step_summary }}
+          MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
+          MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: |
+          node <<'EOF'
+          import fs from 'fs';
+          import nodemailer from 'nodemailer';
+          import { chromium } from 'playwright';
+
+          // ===== CSV =====
+          const csvPath = 'targets.csv';
+          if (!fs.existsSync(csvPath)) {
+            console.log('targets.csv がありません。');
+            process.exit(0);
+          }
+          const lines = fs.readFileSync(csvPath, 'utf8')
+            .split('\n').map(s => s.trim()).filter(Boolean);
+
+          // 1行目ヘッダを捨てる
+          lines.shift();
+
+          // name, url, max_price, min_price
+          const targets = lines.map(l => {
+            const [name, url, max_price, min_price] = l.split(',');
+
+            return {
+              name,
+              url,
+              maxPrice: parseInt(max_price || '0', 10) || 0,  // 0なら上限なし
+              minPrice: parseInt(min_price || '0', 10) || 0   // 0なら下限なし
+            };
+          });
+
+          // ===== last_seen =====
+          const seenPath = 'last_seen.json';
+          let seen = {};
+          try {
+            seen = JSON.parse(fs.readFileSync(seenPath, 'utf8'));
+          } catch {}
+
+          const browser = await chromium.launch({ headless: true });
+          const page = await browser.newPage();
+
+          const foundMsgs = [];
+          for (const t of targets) {
+            if (!t.url) continue;
+            console.log(`🔎 Checking: ${t.name}`);
+
+            // --- ページ遷移 ---
+            try {
+              await page.goto(t.url, { waitUntil: 'domcontentloaded', timeout: 120000 });
+            } catch (e) {
+              console.log(`⚠️ ${t.name}: ページ遷移エラー (${e?.message || e})`);
+              continue;
+            }
+
+            // --- Mercari 検索APIレスポンス待ち ---
+            let data = null;
+            try {
+              const resp = await page.waitForResponse(
+                r => r.url().includes('/v2/entities:search') && r.ok(),
+                { timeout: 20000 }
+              );
+              data = await resp.json();
+            } catch (e) {
+              console.log(`⚠️ ${t.name}: 価格情報取得失敗 (${e?.message || e})`);
+              continue;
+            }
+
+            const item = (data?.items && data.items[0]) ? data.items[0] : null;
+            if (!item) {
+              console.log(`⚠️ ${t.name}: ヒット0件`);
+              continue;
+            }
+
+            const id = item.id;
+            const price = parseInt(item.price || '0', 10);
+            const status = item.status || '';
+            const detailUrl = `https://jp.mercari.com/item/${id}`;
+            const searchUrl = t.url; // ← 新着順の検索結果URL（CSVのurl）
+
+            // 条件計算
+            const isNew = seen[t.name] !== id;
+
+            const isOnSale =
+              status.includes('TRADING') ||
+              status.includes('ON_SALE') ||
+              status === 'ITEM_STATUS_TRADING';
+
+            const priceOk =
+              (t.maxPrice === 0 || price <= t.maxPrice) &&
+              (t.minPrice === 0 || price >= t.minPrice);
+
+            if (isNew && isOnSale && priceOk) {
+              foundMsgs.push({
+                name: t.name,
+                price,
+                url: detailUrl,   // 個別商品URL
+                searchUrl,        // 検索結果URL（新着順）
+                id,
+                prev: seen[t.name] || ''
+              });
+              seen[t.name] = id;
+            } else {
+              if (!seen[t.name]) seen[t.name] = id;
+            }
+          }
+
+          await browser.close();
+
+          // ===== Summary =====
+          const linesOut = [];
+          if (foundMsgs.length) {
+            linesOut.push('## 🛎 新着検出\n');
+            for (const x of foundMsgs) {
+              // GitHub のサマリーからは「検索結果（新着順）」に飛ぶ
+              linesOut.push(
+                `- **${x.name}** 新着: ¥${x.price.toLocaleString()} → ${x.searchUrl}`
+              );
+            }
+            linesOut.push('');
+          } else {
+            linesOut.push('新着はありません。');
+          }
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY || 'summary.md', linesOut.join('\n'));
+
+          // ===== Gmail 通知 =====
+          if (foundMsgs.length) {
+            const user = process.env.MAIL_USERNAME;
+            const pass = process.env.MAIL_PASSWORD;
+            const to   = process.env.MAIL_TO || user;
+
+            if (user && pass) {
+              const transporter = nodemailer.createTransport({
+                host: 'smtp.gmail.com',
+                port: 465,
+                secure: true,
+                auth: { user, pass }
+              });
+
+              const text = foundMsgs.map(x =>
+                [
+                  `【${x.name}】¥${x.price}`,
+                  `検索結果(新着順): ${x.searchUrl}`,
+                  `商品詳細: ${x.url}`,
+                  `new:${x.id} prev:${x.prev}`,
+                  ''
+                ].join('\n')
+              ).join('\n');
+
+              try {
+                await transporter.sendMail({
+                  from: user,
+                  to,
+                  subject: `Mercari 新着 ${foundMsgs.length}件`,
+                  text
+                });
+                console.log('📧 Gmail 送信 OK');
+              } catch (e) {
+                console.log('📧 Gmail 送信失敗:', e?.message || e);
+              }
+            } else {
+              console.log('📧 MAIL_USERNAME / MAIL_PASSWORD が未設定（通知スキップ）');
+            }
+          }
+
+          // ===== 状態保存 =====
+          fs.writeFileSync(seenPath, JSON.stringify(seen, null, 2));
+          console.log('Watch 完了');
+          EOF
+
+      # 実行時刻と last_seen.json の保存
+      - name: Save state
+        run: |
+          mkdir -p .github
+          date -u +%s > .github/last_run_utc.txt
+          if git status --porcelain | grep -qE "last_seen.json|.github/last_run_utc.txt"; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add last_seen.json .github/last_run_utc.txt
+            git commit -m "chore: update state (last_seen, last_run)"
+            git push
+          else
+            echo "no state changes"
+          fi
