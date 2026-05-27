@@ -219,7 +219,7 @@ jobs:
                 await transporter.sendMail({
                   from: user,
                   to,
-                  subject: `Mercari 新着 ${foundMsgs.length}件`,
+                  subject: `②Mercari 新着 ${foundMsgs.length}件`,
                   text
                 });
                 console.log('📧 Gmail 送信 OK');
